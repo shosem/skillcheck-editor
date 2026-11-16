@@ -95,6 +95,7 @@ button.toggle.off{color:var(--muted)}
   <select id="lang" title="言語"></select>
   <select id="compiler" title="バージョン"></select>
   <button id="run" class="run" title="Ctrl/Cmd + Enter">実行</button>
+  <button id="stop" class="small" hidden title="ブラウザ内で実行中のプログラムを止めます">停止</button>
   <span id="status"></span>
   <span class="spacer"></span>
   <button id="hint-toggle" class="small toggle" title="入力中の単語候補（Tabで確定、Enterは常に改行）">予測変換</button>
@@ -136,6 +137,69 @@ button.toggle.off{color:var(--muted)}
   </section>
 </main>
 
+<script type="text/plain" id="ruby-worker">
+const PKG = '2.10.1';
+let RubyVMc = null, shim = null;
+const mods = {};
+const WRAP = `$stdout.sync = true; $stderr.sync = true
+begin
+  load "/main.rb"
+  0
+rescue SystemExit => e
+  e.status
+rescue Exception => e
+  bt = (e.backtrace || []).select { |l| l.start_with?("/main.rb") }.map { |l| l.sub("/main.rb", "main.rb") }
+  $stderr.puts "#{bt.first ? bt.first + ': ' : ''}#{e.message} (#{e.class})"
+  bt.drop(1).each { |l| $stderr.puts "\\tfrom #{l}" }
+  1
+end`;
+async function libs() {
+  if (RubyVMc) return;
+  const a = await import('https://cdn.jsdelivr.net/npm/@ruby/wasm-wasi@' + PKG + '/+esm');
+  const b = await import('https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.4.2/+esm');
+  RubyVMc = a.RubyVM; shim = b;
+}
+async function getModule(ver) {
+  if (mods[ver]) return mods[ver];
+  const res = await fetch('https://cdn.jsdelivr.net/npm/@ruby/' + ver + '-wasm-wasi@' + PKG + '/dist/ruby+stdlib.wasm');
+  if (!res.ok) throw new Error('Ruby本体の取得に失敗しました（HTTP ' + res.status + '）');
+  const reader = res.body.getReader(), chunks = [];
+  let got = 0, last = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    if (got - last > 524288) { last = got; postMessage({ type: 'progress', mb: got / 1048576 }); }
+  }
+  const buf = new Uint8Array(got); let o = 0;
+  for (const c of chunks) { buf.set(c, o); o += c.length; }
+  return (mods[ver] = await WebAssembly.compile(buf));
+}
+self.onmessage = async (e) => {
+  const { id, ver, code, stdin } = e.data;
+  try {
+    await libs();
+    const mod = await getModule(ver);
+    const { WASI, File, OpenFile, PreopenDirectory } = shim;
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    const t0 = performance.now();
+    const outF = new File([]), errF = new File([]);
+    const fds = [
+      new OpenFile(new File(enc.encode(stdin))), new OpenFile(outF), new OpenFile(errF),
+      new PreopenDirectory('/', new Map([['main.rb', new File(enc.encode(code))]]))
+    ];
+    const wasi = new WASI(['ruby'], [], fds, { debug: false });
+    const { vm } = await RubyVMc.instantiateModule({ module: mod, wasip1: wasi });
+    const t1 = performance.now();
+    let status = '1', extra = '';
+    try { status = vm.eval(WRAP).toString(); } catch (err) { extra = String((err && err.message) || err); }
+    const t2 = performance.now();
+    postMessage({ type: 'done', id, out: dec.decode(outF.data), err: dec.decode(errF.data) + extra, status, boot: Math.round(t1 - t0), run: Math.round(t2 - t1) });
+  } catch (err) {
+    postMessage({ type: 'fail', id, message: String((err && err.message) || err) });
+  }
+};
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
@@ -295,20 +359,34 @@ if (typeof document !== 'undefined') (function () {
       byLang = {};
       for (const c of list) (byLang[c.language] = byLang[c.language] || []).push(c);
       for (const k in byLang) byLang[k].sort((a, b) => (isHead(a) - isHead(b)) || cmpVer(a, b));
-      const all = Object.keys(byLang);
-      langs = [...PREFER_ORDER.filter(l => byLang[l]), ...all.filter(l => !PREFER_ORDER.includes(l)).sort()];
-      $('lang').innerHTML = '';
-      for (const l of langs) $('lang').add(new Option(l, l));
-      const saved = store.get('pz_lang', 'Python');
-      $('lang').value = byLang[saved] ? saved : langs[0];
+      if (!byLang['Ruby']) byLang['Ruby'] = [];
       $('status').textContent = '';
-      setLanguage($('lang').value, true);
+      populateLangs();
     } catch (e) {
-      $('status').textContent = '一覧の取得に失敗（ネットワークを確認して再読込）';
+      // Wandbox に繋がらなくても、ブラウザ内で動く Ruby は使える
+      byLang = { 'Ruby': [] };
+      $('status').textContent = 'Wandbox の一覧を取得できませんでした（Ruby はブラウザ内で実行できます）';
+      populateLangs();
     }
+  }
+  function populateLangs() {
+    const all = Object.keys(byLang);
+    langs = [...PREFER_ORDER.filter(l => byLang[l]), ...all.filter(l => !PREFER_ORDER.includes(l)).sort()];
+    $('lang').innerHTML = '';
+    for (const l of langs) $('lang').add(new Option(l, l));
+    const saved = store.get('pz_lang', 'Python');
+    $('lang').value = byLang[saved] ? saved : langs[0];
+    setLanguage($('lang').value, true);
   }
 
   let curLang = null;
+  // ブラウザ内（WebAssembly）で実行できる言語。通信が要らず、外部サービスの混雑や制限の影響を受けない
+  const WASM_ENGINES = {
+    'Ruby': [
+      { value: 'wasm:4.0', label: 'Ruby 4.0（ブラウザ内で実行）', mb: 33 },
+      { value: 'wasm:3.4', label: 'Ruby 3.4（ブラウザ内で実行）', mb: 31 }
+    ]
+  };
   // インデントの既定値（言語の慣習）。載っていない言語は4スペース。'tab' はタブ文字
   const INDENT = [
     [/^(ruby|javascript|typescript|coffee|crystal|elixir|haskell|ocaml|lisp|scala|bash|shell|sql|r$|dart|lua|pascal|nim|pony)/i, 2],
@@ -330,11 +408,14 @@ if (typeof document !== 'undefined') (function () {
     // コンパイラ選択
     const sel = $('compiler'); sel.innerHTML = '';
     const cs = byLang[lang] || [];
-    for (const c of cs) sel.add(new Option(`${c['display-name'] || c.name} ${c.version || ''}`.trim(), c.name));
+    const wasm = WASM_ENGINES[lang] || [];
+    for (const w of wasm) sel.add(new Option(w.label, w.value));
+    for (const c of cs) sel.add(new Option(`${c['display-name'] || c.name} ${c.version || ''}`.trim() + (wasm.length ? '（Wandbox）' : ''), c.name));
     const savedC = store.get('pz_compiler_' + lang, null);
     const pref = PREFER_COMPILER[lang];
-    const def = (savedC && cs.find(c => c.name === savedC)) || (pref && cs.find(c => !isHead(c) && pref.test(c.name))) || cs.find(c => !isHead(c)) || cs[0];
-    if (def) sel.value = def.name;
+    const def = (savedC && [...sel.options].find(o => o.value === savedC) && savedC) || (wasm[0] && wasm[0].value) ||
+      (pref && (cs.find(c => !isHead(c) && pref.test(c.name)) || {}).name) || (cs.find(c => !isHead(c)) || cs[0] || {}).name;
+    if (def) sel.value = def;
     // エディタ
     cm.setOption('mode', modeFor(lang));
     cm.setOption('autoCloseBrackets', bracketConf(lang));
@@ -486,31 +567,82 @@ if (typeof document !== 'undefined') (function () {
     const p = document.createElement('pre'); if (cls) p.className = cls; p.textContent = text; out.appendChild(p);
   }
   let running = false;
+  function renderResult(r, note) {
+    if (r.compiler_error || r.compiler_message) addBlock('コンパイラ出力', r.compiler_error || r.compiler_message, r.compiler_error ? 'err' : '');
+    if (r.program_output) addBlock('標準出力', r.program_output);
+    else if (!r.compiler_error && !r.program_error) addBlock('標準出力', '（出力なし）');
+    if (r.program_error) addBlock('標準エラー出力', r.program_error, 'err');
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const code = String(r.status ?? '');
+    meta.innerHTML = '終了コード: <span class="' + (code === '0' ? 'good' : 'bad') + '"></span>' + (r.signal ? ' / シグナル: ' + '<span class="bad"></span>' : '') + ' ／ <span class="note"></span>';
+    const spans = meta.querySelectorAll('span'); spans[0].textContent = code || '-'; if (r.signal) spans[1].textContent = r.signal;
+    meta.querySelector('.note').textContent = note;
+    out.appendChild(meta);
+  }
+
+  /* --- ブラウザ内で Ruby を実行（Web Worker。停止ボタンで中断できる） --- */
+  let rubyWorker = null, rubyJob = null, jobId = 0;
+  function getRubyWorker() {
+    if (!rubyWorker) {
+      const blob = new Blob([$('ruby-worker').textContent], { type: 'text/javascript' });
+      rubyWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+    }
+    return rubyWorker;
+  }
+  function runRuby(ver, code, input, onProgress) {
+    return new Promise((resolve, reject) => {
+      const w = getRubyWorker(), id = ++jobId;
+      rubyJob = { reject };
+      w.onmessage = ev => {
+        const m = ev.data;
+        if (m.type === 'progress') onProgress(m.mb);
+        else if (m.type === 'done') { rubyJob = null; resolve(m); }
+        else if (m.type === 'fail') { rubyJob = null; reject(new Error(m.message)); }
+      };
+      w.onerror = ev => { rubyJob = null; rubyWorker = null; reject(new Error(ev.message || 'ブラウザ内実行の準備に失敗しました')); };
+      w.postMessage({ id, ver, code, stdin: input });
+    });
+  }
+  function stopRuby() {
+    if (rubyWorker) { rubyWorker.terminate(); rubyWorker = null; }
+    if (rubyJob) { rubyJob.reject(new Error('STOPPED')); rubyJob = null; }
+  }
+  $('stop').onclick = stopRuby;
+
   async function run() {
     if (running || !curLang) return;
     running = true; $('run').disabled = true; $('run').textContent = '実行中…';
     out.innerHTML = '';
     let input = stdin.value; if (input && !input.endsWith('\n')) input += '\n';
     const t0 = performance.now();
+    const comp = $('compiler').value;
     try {
-      const res = await fetch('https://wandbox.org/api/compile.json', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ compiler: $('compiler').value, code: cm.getValue(), stdin: input, save: false })
-      });
-      if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 300));
-      const r = await res.json();
-      const ms = Math.round(performance.now() - t0);
-      if (r.compiler_error || r.compiler_message) addBlock('コンパイラ出力', r.compiler_error || r.compiler_message, r.compiler_error ? 'err' : '');
-      if (r.program_output) addBlock('標準出力', r.program_output);
-      else if (!r.compiler_error && !r.program_error) addBlock('標準出力', '（出力なし）');
-      if (r.program_error) addBlock('標準エラー出力', r.program_error, 'err');
-      const meta = document.createElement('div'); meta.className = 'meta';
-      const code = String(r.status ?? '');
-      meta.innerHTML = '終了コード: <span class="' + (code === '0' ? 'good' : 'bad') + '"></span>' + (r.signal ? ' / シグナル: ' + '<span class="bad"></span>' : '') + ' ／ ' + ms + ' ms（通信込み）';
-      const spans = meta.querySelectorAll('span'); spans[0].textContent = code || '-'; if (r.signal) spans[1].textContent = r.signal;
-      out.appendChild(meta);
+      if (comp.startsWith('wasm:')) {
+        const eng = (WASM_ENGINES[curLang] || []).find(w => w.value === comp);
+        const note = document.createElement('div'); note.className = 'label'; out.appendChild(note);
+        note.textContent = '準備中…（初回は Ruby 本体を読み込むため、時間がかかります）';
+        $('stop').hidden = false;
+        let m;
+        try {
+          m = await runRuby(comp.slice(5), cm.getValue(), input, mb => {
+            note.textContent = 'Ruby を読み込み中… ' + mb.toFixed(1) + ' / 約' + (eng ? eng.mb : '?') + ' MB（初回のみ。次回からはブラウザに残ります）';
+          });
+        } finally { $('stop').hidden = true; }
+        out.innerHTML = '';
+        renderResult({ program_output: m.out, program_error: m.err, status: m.status }, 'ブラウザ内実行（起動 ' + m.boot + ' ms / 実行 ' + m.run + ' ms）');
+      } else {
+        const res = await fetch('https://wandbox.org/api/compile.json', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ compiler: comp, code: cm.getValue(), stdin: input, save: false })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 300));
+        const r = await res.json();
+        renderResult(r, Math.round(performance.now() - t0) + ' ms（通信込み）');
+      }
     } catch (e) {
-      addBlock('実行に失敗しました', String(e.message || e), 'err');
+      out.innerHTML = '';
+      if (String(e.message) === 'STOPPED') addBlock('', '停止しました', 'err');
+      else addBlock('実行に失敗しました', String(e.message || e) + (comp.startsWith('wasm:') ? '\n\n（バージョンの選択で「Wandbox」の付いたものを選ぶと、外部サービスで実行できます）' : ''), 'err');
     } finally {
       running = false; $('run').disabled = false; $('run').textContent = '実行';
     }
